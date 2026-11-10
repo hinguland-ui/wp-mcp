@@ -1,0 +1,445 @@
+// WPConnect AI – MySQL 8 schema (Prisma)
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider     = "mysql"
+  url          = env("DATABASE_URL")
+  relationMode = "foreignKeys"
+}
+
+enum UserRole {
+  USER
+  ADMIN
+}
+
+enum WebsiteStatus {
+  PENDING
+  VERIFIED
+  CONNECTED
+  DISCONNECTED
+  SUSPENDED
+}
+
+enum VerificationMethod {
+  META_TAG
+  DNS_TXT
+  PLUGIN_HANDSHAKE
+}
+
+enum VerificationStatus {
+  PENDING
+  VERIFIED
+  FAILED
+  EXPIRED
+}
+
+enum ClientAuthMethod {
+  none
+  client_secret_basic
+}
+
+enum PermissionEffect {
+  ALLOW
+  DENY
+}
+
+enum ActivityStatus {
+  SUCCESS
+  DENIED
+  ERROR
+}
+
+enum SubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  CANCELED
+  EXPIRED
+}
+
+enum BillingInterval {
+  MONTHLY
+  YEARLY
+}
+
+// ───────────────────────── Identity ─────────────────────────
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique @db.VarChar(255)
+  name         String   @db.VarChar(120)
+  passwordHash String   @db.VarChar(255)
+  role         UserRole @default(USER)
+  emailVerifiedAt DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  websites       Website[]
+  authorizations OAuthAuthorization[]
+  accessTokens   AccessToken[]
+  refreshTokens  RefreshToken[]
+  oauthClients   OAuthClient[]
+  mcpClients     MCPClient[]
+  activityLogs   ActivityLog[]
+  usageRecords   UsageRecord[]
+  subscriptions  Subscription[]
+  billingEvents  BillingEvent[]
+  presets        PermissionPreset[]
+
+  @@index([createdAt])
+}
+
+// ───────────────────────── Websites ─────────────────────────
+
+model Website {
+  id        String        @id @default(cuid())
+  userId    String
+  name      String        @db.VarChar(120)
+  url       String        @db.VarChar(500)
+  host      String        @db.VarChar(255)
+  status    WebsiteStatus @default(PENDING)
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+
+  user         User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  connection   WebsiteConnection?
+  verifications WebsiteVerification[]
+  permissions  WebsitePermission[]
+  clientPermissions ClientPermission[]
+  authorizations OAuthAuthorization[]
+  accessTokens AccessToken[]
+  mcpRequests  MCPRequest[]
+  activityLogs ActivityLog[]
+  usageRecords UsageRecord[]
+
+  @@unique([userId, host])
+  @@index([status])
+}
+
+model WebsiteConnection {
+  id             String    @id @default(cuid())
+  websiteId      String    @unique
+  siteSecretHash String    @db.VarChar(255) // HMAC secret for signed requests to/from the plugin (stored hashed)
+  encryptedSiteSecret String? @db.Text      // AES-256-GCM sealed copy, needed to sign outbound calls
+  pluginVersion  String?   @db.VarChar(32)
+  wpVersion      String?   @db.VarChar(32)
+  phpVersion     String?   @db.VarChar(32)
+  hasElementor   Boolean   @default(false)
+  hasWooCommerce Boolean   @default(false)
+  lastSeenAt     DateTime?
+  connectedAt    DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  website Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+}
+
+model WebsiteVerification {
+  id        String             @id @default(cuid())
+  websiteId String
+  method    VerificationMethod
+  tokenHash String             @db.VarChar(128)
+  status    VerificationStatus @default(PENDING)
+  expiresAt DateTime
+  verifiedAt DateTime?
+  createdAt DateTime           @default(now())
+
+  website Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  @@unique([tokenHash])
+  @@index([websiteId, status])
+  @@index([expiresAt])
+}
+
+// ───────────────────────── OAuth 2.1 ─────────────────────────
+
+model OAuthScope {
+  id          String  @id @default(cuid())
+  name        String  @unique @db.VarChar(64)
+  description String  @db.VarChar(255)
+  isDefault   Boolean @default(false)
+  createdAt   DateTime @default(now())
+}
+
+model OAuthClient {
+  id               String           @id @default(cuid())
+  clientId         String           @unique @db.VarChar(64)
+  clientSecretHash String?          @db.VarChar(255) // null for public (PKCE-only) clients
+  name             String           @db.VarChar(120)
+  redirectUris     Json
+  grantTypes       Json
+  authMethod       ClientAuthMethod @default(none)
+  ownerId          String?
+  isDynamic        Boolean          @default(false) // RFC 7591 dynamic registration
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  owner          User?                @relation(fields: [ownerId], references: [id], onDelete: SetNull)
+  authorizations OAuthAuthorization[]
+  accessTokens   AccessToken[]
+  refreshTokens  RefreshToken[]
+  mcpClients     MCPClient[]
+}
+
+model OAuthAuthorization {
+  id                  String   @id @default(cuid())
+  userId              String
+  oauthClientId       String
+  websiteId           String
+  codeHash            String   @unique @db.VarChar(128)
+  codeChallenge       String   @db.VarChar(128)
+  codeChallengeMethod String   @default("S256") @db.VarChar(10)
+  redirectUri         String   @db.VarChar(500)
+  scope               String   @db.VarChar(500)
+  resource            String?  @db.VarChar(500)
+  expiresAt           DateTime
+  consumedAt          DateTime?
+  createdAt           DateTime @default(now())
+
+  user    User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  client  OAuthClient @relation(fields: [oauthClientId], references: [id], onDelete: Cascade)
+  website Website     @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  accessTokens AccessToken[]
+
+  @@index([userId])
+  @@index([oauthClientId])
+  @@index([websiteId])
+  @@index([expiresAt])
+}
+
+model AccessToken {
+  id              String   @id @default(cuid())
+  tokenHash       String   @unique @db.VarChar(128)
+  userId          String
+  oauthClientId   String
+  websiteId       String
+  authorizationId String?
+  scope           String   @db.VarChar(500)
+  audience        String?  @db.VarChar(500)
+  expiresAt       DateTime
+  revokedAt       DateTime?
+  createdAt       DateTime @default(now())
+
+  user          User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  client        OAuthClient         @relation(fields: [oauthClientId], references: [id], onDelete: Cascade)
+  website       Website             @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  authorization OAuthAuthorization? @relation(fields: [authorizationId], references: [id], onDelete: SetNull)
+  refreshToken  RefreshToken?
+  mcpRequests   MCPRequest[]
+
+  @@index([userId])
+  @@index([oauthClientId])
+  @@index([websiteId])
+  @@index([expiresAt])
+}
+
+model RefreshToken {
+  id            String   @id @default(cuid())
+  tokenHash     String   @unique @db.VarChar(128)
+  accessTokenId String   @unique
+  userId        String
+  oauthClientId String
+  expiresAt     DateTime
+  rotatedAt     DateTime? // set when exchanged; reuse of a rotated token revokes the family
+  revokedAt     DateTime?
+  createdAt     DateTime @default(now())
+
+  accessToken AccessToken @relation(fields: [accessTokenId], references: [id], onDelete: Cascade)
+  user        User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  client      OAuthClient @relation(fields: [oauthClientId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([oauthClientId])
+  @@index([expiresAt])
+}
+
+// ───────────────────────── Permissions ─────────────────────────
+
+model PermissionPreset {
+  id          String   @id @default(cuid())
+  userId      String?  // null = system preset
+  name        String   @db.VarChar(80)
+  description String?  @db.VarChar(255)
+  scopes      Json
+  isSystem    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user        User?               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  websitePermissions WebsitePermission[]
+
+  @@unique([userId, name])
+}
+
+model WebsitePermission {
+  id        String           @id @default(cuid())
+  websiteId String
+  scope     String           @db.VarChar(64)
+  effect    PermissionEffect @default(ALLOW)
+  presetId  String?
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+
+  website Website           @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  preset  PermissionPreset? @relation(fields: [presetId], references: [id], onDelete: SetNull)
+
+  @@unique([websiteId, scope])
+  @@index([presetId])
+}
+
+model ClientPermission {
+  id          String           @id @default(cuid())
+  mcpClientId String
+  websiteId   String
+  scope       String           @db.VarChar(64)
+  effect      PermissionEffect @default(ALLOW)
+  createdAt   DateTime         @default(now())
+
+  mcpClient MCPClient @relation(fields: [mcpClientId], references: [id], onDelete: Cascade)
+  website   Website   @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  @@unique([mcpClientId, websiteId, scope])
+  @@index([websiteId])
+}
+
+// ───────────────────────── MCP ─────────────────────────
+
+model MCPClient {
+  id            String   @id @default(cuid())
+  userId        String
+  oauthClientId String?
+  name          String   @db.VarChar(120)
+  userAgent     String?  @db.VarChar(255)
+  lastSeenAt    DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  oauthClient OAuthClient? @relation(fields: [oauthClientId], references: [id], onDelete: SetNull)
+  permissions ClientPermission[]
+  requests    MCPRequest[]
+
+  @@index([userId])
+  @@index([oauthClientId])
+}
+
+model MCPRequest {
+  id            String   @id @default(cuid())
+  mcpClientId   String?
+  websiteId     String
+  accessTokenId String?
+  sessionId     String?  @db.VarChar(64)
+  jsonRpcId     String?  @db.VarChar(64)
+  method        String   @db.VarChar(120) // e.g. tools/call
+  toolName      String?  @db.VarChar(120)
+  status        ActivityStatus
+  durationMs    Int?
+  errorCode     Int?
+  createdAt     DateTime @default(now())
+
+  mcpClient   MCPClient?  @relation(fields: [mcpClientId], references: [id], onDelete: SetNull)
+  website     Website     @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  accessToken AccessToken? @relation(fields: [accessTokenId], references: [id], onDelete: SetNull)
+
+  @@index([websiteId, createdAt])
+  @@index([mcpClientId])
+  @@index([accessTokenId])
+  @@index([toolName])
+}
+
+// ───────────────────────── Observability ─────────────────────────
+
+model ActivityLog {
+  id         String         @id @default(cuid())
+  userId     String?
+  websiteId  String?
+  action     String         @db.VarChar(120)
+  status     ActivityStatus @default(SUCCESS)
+  ip         String?        @db.VarChar(45)
+  userAgent  String?        @db.VarChar(255)
+  metadata   Json?
+  createdAt  DateTime       @default(now())
+
+  user    User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  website Website? @relation(fields: [websiteId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([websiteId, createdAt])
+  @@index([action])
+}
+
+model UsageRecord {
+  id        String   @id @default(cuid())
+  userId    String
+  websiteId String?
+  metric    String   @db.VarChar(64) // e.g. mcp_requests
+  quantity  Int      @default(1)
+  period    String   @db.VarChar(7) // YYYY-MM
+  createdAt DateTime @default(now())
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  website Website? @relation(fields: [websiteId], references: [id], onDelete: SetNull)
+
+  @@index([userId, period, metric])
+  @@index([websiteId])
+}
+
+// ───────────────────────── Billing ─────────────────────────
+
+model Plan {
+  id               String          @id @default(cuid())
+  code             String          @unique @db.VarChar(32)
+  name             String          @db.VarChar(80)
+  priceCents       Int
+  currency         String          @default("USD") @db.VarChar(3)
+  interval         BillingInterval @default(MONTHLY)
+  maxWebsites      Int
+  monthlyRequests  Int
+  features         Json?
+  isActive         Boolean         @default(true)
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  subscriptions Subscription[]
+}
+
+model Subscription {
+  id                   String             @id @default(cuid())
+  userId               String
+  planId               String
+  status               SubscriptionStatus @default(TRIALING)
+  providerCustomerId   String?            @db.VarChar(128)
+  providerSubscriptionId String?          @unique @db.VarChar(128)
+  currentPeriodStart   DateTime
+  currentPeriodEnd     DateTime
+  cancelAtPeriodEnd    Boolean            @default(false)
+  createdAt            DateTime           @default(now())
+  updatedAt            DateTime           @updatedAt
+
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  plan          Plan           @relation(fields: [planId], references: [id], onDelete: Restrict)
+  billingEvents BillingEvent[]
+
+  @@index([userId, status])
+  @@index([planId])
+}
+
+model BillingEvent {
+  id             String   @id @default(cuid())
+  userId         String?
+  subscriptionId String?
+  providerEventId String  @unique @db.VarChar(128) // idempotency for webhooks
+  type           String   @db.VarChar(80)
+  payload        Json
+  processedAt    DateTime?
+  createdAt      DateTime @default(now())
+
+  user         User?         @relation(fields: [userId], references: [id], onDelete: SetNull)
+  subscription Subscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([subscriptionId])
+  @@index([type, createdAt])
+}

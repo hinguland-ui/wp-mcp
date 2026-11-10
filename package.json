@@ -1,0 +1,35 @@
+{
+  "name": "wpconnect-ai",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "npm@10.8.0",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "setup": "node scripts/setup.mjs",
+    "web": "npm run build:shared && node scripts/run.mjs concurrently -k -n api,mcp,web -c blue,magenta,green \"cross-env PORT=4000 npm run start:dev -w @wpconnect/api\" \"cross-env PORT=4100 npm run dev -w @wpconnect/mcp\" \"npm run dev -w @wpconnect/web\"",
+    "build:shared": "npm run build -w @wpconnect/shared",
+    "db:push": "node scripts/run.mjs prisma db push --schema prisma/schema.prisma",
+    "db:seed": "node scripts/run.mjs tsx prisma/seed.ts",
+    "db:generate": "prisma generate --schema prisma/schema.prisma",
+    "make-admin": "node scripts/run.mjs node scripts/make-admin.mjs",
+    "create-admin": "node scripts/run.mjs node scripts/create-admin.mjs",
+    "build": "npm run build:shared && npm run db:generate && npm run build -w @wpconnect/api && npm run build -w @wpconnect/mcp && npm run build -w @wpconnect/web",
+    "start": "node server.mjs"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.7",
+    "cross-env": "^10.1.0",
+    "prisma": "^6.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.0.0"
+  }
+}
