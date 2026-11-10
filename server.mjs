@@ -15,6 +15,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 import http from 'node:http';
 import net from 'node:net';
+import { existsSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { loadEnv } from './scripts/env.mjs';
@@ -22,7 +23,8 @@ import { loadEnv } from './scripts/env.mjs';
 loadEnv();
 const require = createRequire(import.meta.url);
 
-const PORT = Number(process.env.PORT || 3000);
+// Some hosts pass a socket path instead of a number in PORT — listen() accepts both.
+const PORT = /^\d+$/.test(process.env.PORT ?? '') ? Number(process.env.PORT) : process.env.PORT || 3000;
 const PORTS = {
   web: Number(process.env.WEB_INTERNAL_PORT || 3101),
   api: Number(process.env.API_INTERNAL_PORT || 3102),
@@ -52,22 +54,46 @@ if (process.env.AUTO_MIGRATE !== 'false') {
 }
 
 // ── 2. Start the three apps on private ports (auto-restart if one crashes) ──
+// Hosting panels (LiteSpeed/Passenger etc.) sometimes inject a NODE_OPTIONS hook that hijacks
+// `listen()` in every Node process. The children must bind their own private ports, so drop it.
+const { NODE_OPTIONS: _hostHook, ...cleanEnv } = childEnv;
+
 const nextBin = require.resolve('next/dist/bin/next');
 const apps = {
-  api: { cmd: process.execPath, args: ['apps/api/dist/main.js'], env: { PORT: String(PORTS.api) } },
-  mcp: { cmd: process.execPath, args: ['apps/mcp/dist/index.js'], env: { PORT: String(PORTS.mcp) } },
-  web: { cmd: process.execPath, args: [nextBin, 'start', 'apps/web', '-p', String(PORTS.web), '-H', '127.0.0.1'], env: {} },
+  api: { cmd: process.execPath, args: ['apps/api/dist/main.js'], env: { PORT: String(PORTS.api) }, port: PORTS.api, build: 'apps/api/dist/main.js' },
+  mcp: { cmd: process.execPath, args: ['apps/mcp/dist/index.js'], env: { PORT: String(PORTS.mcp) }, port: PORTS.mcp, build: 'apps/mcp/dist/index.js' },
+  web: { cmd: process.execPath, args: [nextBin, 'start', 'apps/web', '-p', String(PORTS.web), '-H', '127.0.0.1'], env: {}, port: PORTS.web, build: 'apps/web/.next/BUILD_ID' },
 };
 const children = new Map();
+const status = Object.fromEntries(Object.keys(apps).map((n) => [n, { running: false, restarts: 0, lastExit: null, built: existsSync(apps[n].build) }]));
+const logs = Object.fromEntries(Object.keys(apps).map((n) => [n, []]));
 let stopping = false;
+
+for (const [n, s] of Object.entries(status)) if (!s.built) log(`⚠ ${n}: build output missing (${apps[n].build}) — did "npm run build" run on the host?`);
+
+function capture(name, stream, out) {
+  stream.on('data', (buf) => {
+    out.write(buf);
+    const lines = buf.toString('utf8').split(/\r?\n/).filter(Boolean).map((l) => `${new Date().toISOString().slice(11, 19)} ${l}`);
+    logs[name].push(...lines);
+    if (logs[name].length > 80) logs[name].splice(0, logs[name].length - 80);
+  });
+}
 
 function start(name, attempt = 0) {
   const a = apps[name];
-  const child = spawn(a.cmd, a.args, { stdio: 'inherit', env: { ...childEnv, ...a.env } });
+  const child = spawn(a.cmd, a.args, { stdio: ['ignore', 'pipe', 'pipe'], env: { ...cleanEnv, ...a.env } });
+  capture(name, child.stdout, process.stdout);
+  capture(name, child.stderr, process.stderr);
   children.set(name, child);
+  status[name].running = true;
   const startedAt = Date.now();
+  child.on('error', (e) => logs[name].push(`spawn error: ${e.message}`));
   child.on('exit', (code, signal) => {
+    status[name].running = false;
+    status[name].lastExit = { code, signal, at: new Date().toISOString() };
     if (stopping) return;
+    status[name].restarts++;
     const quick = Date.now() - startedAt < 10_000;
     const delay = Math.min(30_000, quick ? 1000 * 2 ** attempt : 1000);
     log(`${name} exited (${signal ?? code}) — restarting in ${delay / 1000}s`);
@@ -75,6 +101,35 @@ function start(name, attempt = 0) {
   });
 }
 Object.keys(apps).forEach((n) => start(n));
+
+const isListening = (port) =>
+  new Promise((res) => {
+    const s = net.connect(port, '127.0.0.1');
+    s.setTimeout(800);
+    s.once('connect', () => (s.destroy(), res(true)));
+    s.once('error', () => res(false));
+    s.once('timeout', () => (s.destroy(), res(false)));
+  });
+
+// Hide secret values if they ever show up in a log line.
+const secrets = ['DB_PASSWORD', 'JWT_SECRET', 'INTERNAL_API_KEY', 'SITE_SECRET_ENCRYPTION_KEY', 'DATABASE_URL']
+  .map((k) => process.env[k])
+  .filter((v) => v && v.length >= 4);
+const redact = (s) => secrets.reduce((acc, v) => acc.split(v).join('***'), s);
+
+async function health(req, res) {
+  const url = new URL(req.url, 'http://x');
+  const appsState = {};
+  for (const n of Object.keys(apps)) appsState[n] = { ...status[n], listening: await isListening(apps[n].port) };
+  const ok = Object.values(appsState).every((a) => a.listening);
+  const body = { status: ok ? 'ok' : 'degraded', node: process.version, apps: appsState };
+  // Logs only with the secret key: /healthz?key=<INTERNAL_API_KEY>
+  if (process.env.INTERNAL_API_KEY && url.searchParams.get('key') === process.env.INTERNAL_API_KEY) {
+    body.logs = Object.fromEntries(Object.entries(logs).map(([n, l]) => [n, l.map(redact)]));
+  }
+  res.writeHead(ok ? 200 : 503, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+  res.end(JSON.stringify(body, null, 2));
+}
 
 // ── 3. Route requests by path ──
 function route(url = '/') {
@@ -102,10 +157,7 @@ function forwardedHeaders(req) {
 }
 
 const server = http.createServer((req, res) => {
-  if (req.url === '/healthz') {
-    res.writeHead(200, { 'content-type': 'application/json' });
-    return res.end(JSON.stringify({ status: 'ok' }));
-  }
+  if (req.url === '/healthz' || req.url?.startsWith('/healthz?')) return void health(req, res);
   const port = route(req.url);
   if (!port) {
     res.writeHead(404, { 'content-type': 'application/json' });
