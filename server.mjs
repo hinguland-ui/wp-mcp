@@ -60,6 +60,22 @@ function pushLog(name, text) {
   if (logs[name].length > max) logs[name].splice(0, logs[name].length - max);
 }
 
+// `npm` is often not on PATH inside a hosting runtime. When started via `npm start`, npm tells us
+// where it lives (npm_execpath), so call it through the current node binary instead.
+const NODE_DIR = process.execPath.replace(/[\\/][^\\/]+$/, '');
+const npmCli = [
+  process.env.npm_execpath,
+  `${NODE_DIR}/../lib/node_modules/npm/bin/npm-cli.js`, // Linux / CloudLinux alt-nodejs layout
+  `${NODE_DIR}/node_modules/npm/bin/npm-cli.js`, // Windows layout
+].find((p) => p && /npm-cli\.js$/.test(p) && existsSync(p));
+const NPM = npmCli ? `"${process.execPath}" "${npmCli}"` : null;
+const pathSep = process.platform === 'win32' ? ';' : ':';
+// Make sure scripts run by npm (tsc, nest, next, prisma) find this same node binary.
+// npm's own bin folder too, because the root "build" script calls `npm run …` again.
+const NPM_DIR = npmCli ? npmCli.replace(/[\\/][^\\/]+$/, '') : '';
+const PATH_KEY = Object.keys(cleanEnv).find((k) => k.toUpperCase() === 'PATH') ?? 'PATH'; // "Path" on Windows
+cleanEnv[PATH_KEY] = [NODE_DIR, NPM_DIR, `${process.cwd()}/node_modules/.bin`, cleanEnv[PATH_KEY] ?? ''].filter(Boolean).join(pathSep);
+
 /** Run a shell command, stream its output to the console and into logs[name]. Resolves with the exit code. */
 function run(name, cmd, env = cleanEnv) {
   return new Promise((resolve) => {
@@ -114,7 +130,7 @@ function start(name, attempt = 0) {
 
 // ── Boot sequence (runs after the port is open, so the host sees the app as "up") ──
 const missingBuilds = () => Object.keys(apps).filter((n) => !existsSync(apps[n].build));
-const hasBuildTools = () => ['node_modules/typescript', 'node_modules/@nestjs/cli', 'node_modules/prisma'].every((p) => existsSync(p));
+const hasBuildTools = () => ['node_modules/typescript', 'node_modules/prisma', 'node_modules/tailwindcss', 'node_modules/@types/node'].every((p) => existsSync(p));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const LOCK = '.build.lock';
 
@@ -132,14 +148,18 @@ async function ensureBuilt() {
   phase = 'building';
   try {
     if (!hasBuildTools()) {
-      log('build tools (devDependencies) not installed — installing them…');
-      // NODE_ENV=production would make npm skip devDependencies, so force them in.
-      if ((await run('build', 'npm install --include=dev --no-audit --no-fund', { ...cleanEnv, NODE_ENV: 'development' })) !== 0) {
-        log('✖ npm install failed — see /healthz?key=… logs.build');
+      if (!NPM) {
+        log('✖ build tools are not installed and npm was not found on this host. Redeploy so the host runs "npm install" (build tools are regular dependencies now).');
+        return false;
+      }
+      log('build tools not installed — installing them…');
+      if ((await run('build', `${NPM} install --include=dev --no-audit --no-fund`, { ...cleanEnv, NODE_ENV: 'development' })) !== 0) {
+        log('✖ npm install failed — see /healthz logs');
         return false;
       }
     }
-    if ((await run('build', 'npm run build', { ...cleanEnv, NODE_ENV: 'production' })) !== 0) {
+    // Build with node only (no npm needed).
+    if ((await run('build', `"${process.execPath}" scripts/build.mjs`, { ...cleanEnv, NODE_ENV: 'production' })) !== 0) {
       log('✖ build failed — see /healthz?key=… logs.build');
       return false;
     }
@@ -202,6 +222,19 @@ async function health(req, res) {
   for (const n of Object.keys(apps)) appsState[n] = { ...status[n], listening: await isListening(apps[n].port) };
   const ok = Object.values(appsState).every((a) => a.listening);
   const body = { status: ok ? 'ok' : 'degraded', phase, node: process.version, apps: appsState };
+  // When setup failed, show the tail of the build/db output publicly (secrets redacted) so it can be fixed.
+  if (phase === 'build-failed') body.buildError = [...logs.server.slice(-8), ...logs.build.slice(-30)].map(redact);
+  if (phase === 'running' && logs.db.some((l) => /error/i.test(l))) body.databaseError = logs.db.slice(-15).map(redact);
+  body.env = {
+    PUBLIC_URL: !!process.env.PUBLIC_URL,
+    DB_HOST: !!process.env.DB_HOST,
+    DB_NAME: !!process.env.DB_NAME,
+    DB_USER: !!process.env.DB_USER,
+    DB_PASSWORD: !!process.env.DB_PASSWORD,
+    JWT_SECRET: !!process.env.JWT_SECRET,
+    INTERNAL_API_KEY: !!process.env.INTERNAL_API_KEY,
+    SITE_SECRET_ENCRYPTION_KEY: !!process.env.SITE_SECRET_ENCRYPTION_KEY,
+  };
   // Logs only with the secret key: /healthz?key=<INTERNAL_API_KEY>
   if (process.env.INTERNAL_API_KEY && url.searchParams.get('key') === process.env.INTERNAL_API_KEY) {
     body.logs = Object.fromEntries(Object.entries(logs).map(([n, l]) => [n, l.map(redact)]));

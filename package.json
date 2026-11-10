@@ -19,17 +19,17 @@
     "db:generate": "prisma generate --schema prisma/schema.prisma",
     "make-admin": "node scripts/run.mjs node scripts/make-admin.mjs",
     "create-admin": "node scripts/run.mjs node scripts/create-admin.mjs",
-    "build": "npm run build:shared && npm run db:generate && npm run build -w @wpconnect/api && npm run build -w @wpconnect/mcp && npm run build -w @wpconnect/web",
+    "build": "node scripts/build.mjs",
     "start": "node server.mjs"
   },
   "devDependencies": {
     "concurrently": "^10.0.7",
-    "cross-env": "^10.1.0",
+    "cross-env": "^10.1.0"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.0.0",
     "prisma": "^6.0.0",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0"
-  },
-  "dependencies": {
-    "@prisma/client": "^6.0.0"
   }
 }
