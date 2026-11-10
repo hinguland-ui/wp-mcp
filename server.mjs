@@ -15,8 +15,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
 import http from 'node:http';
 import net from 'node:net';
-import { existsSync } from 'node:fs';
-import { spawn, spawnSync } from 'node:child_process';
+import { existsSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { loadEnv } from './scripts/env.mjs';
 
@@ -43,21 +43,37 @@ const childEnv = {
   TRUST_PROXY_HOPS: process.env.TRUST_PROXY_HOPS || '2',
 };
 
-const log = (...a) => console.log('[server]', ...a);
+const log = (...a) => {
+  console.log('[server]', ...a);
+  pushLog('server', a.join(' '));
+};
 
-// ── 1. Database: create/upgrade tables and add default plans/scopes (safe to repeat) ──
-if (process.env.AUTO_MIGRATE !== 'false') {
-  log('syncing database schema…');
-  const push = spawnSync('npx prisma db push --schema prisma/schema.prisma --skip-generate', { stdio: 'inherit', shell: true, env: childEnv });
-  if (push.status === 0) spawnSync('npx tsx prisma/seed.ts', { stdio: 'inherit', shell: true, env: childEnv });
-  else log('⚠ database sync failed — check DB_HOST / DB_USER / DB_PASSWORD / DB_NAME. Continuing anyway.');
-}
-
-// ── 2. Start the three apps on private ports (auto-restart if one crashes) ──
 // Hosting panels (LiteSpeed/Passenger etc.) sometimes inject a NODE_OPTIONS hook that hijacks
 // `listen()` in every Node process. The children must bind their own private ports, so drop it.
 const { NODE_OPTIONS: _hostHook, ...cleanEnv } = childEnv;
 
+const logs = { server: [], build: [], db: [], api: [], mcp: [], web: [] };
+function pushLog(name, text) {
+  const lines = String(text).split(/\r?\n/).filter(Boolean).map((l) => `${new Date().toISOString().slice(11, 19)} ${l}`);
+  logs[name].push(...lines);
+  const max = name === 'build' ? 200 : 80;
+  if (logs[name].length > max) logs[name].splice(0, logs[name].length - max);
+}
+
+/** Run a shell command, stream its output to the console and into logs[name]. Resolves with the exit code. */
+function run(name, cmd, env = cleanEnv) {
+  return new Promise((resolve) => {
+    pushLog(name, `$ ${cmd}`);
+    const p = spawn(cmd, { shell: true, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    for (const s of [p.stdout, p.stderr]) s.on('data', (b) => (process.stdout.write(b), pushLog(name, b.toString('utf8'))));
+    p.on('error', (e) => (pushLog(name, `error: ${e.message}`), resolve(1)));
+    p.on('exit', (code) => resolve(code ?? 1));
+  });
+}
+
+let phase = 'starting';
+
+// ── The three apps, each on a private port (auto-restart if one crashes) ──
 const nextBin = require.resolve('next/dist/bin/next');
 const apps = {
   api: { cmd: process.execPath, args: ['apps/api/dist/main.js'], env: { PORT: String(PORTS.api) }, port: PORTS.api, build: 'apps/api/dist/main.js' },
@@ -65,18 +81,13 @@ const apps = {
   web: { cmd: process.execPath, args: [nextBin, 'start', 'apps/web', '-p', String(PORTS.web), '-H', '127.0.0.1'], env: {}, port: PORTS.web, build: 'apps/web/.next/BUILD_ID' },
 };
 const children = new Map();
-const status = Object.fromEntries(Object.keys(apps).map((n) => [n, { running: false, restarts: 0, lastExit: null, built: existsSync(apps[n].build) }]));
-const logs = Object.fromEntries(Object.keys(apps).map((n) => [n, []]));
+const status = Object.fromEntries(Object.keys(apps).map((n) => [n, { running: false, restarts: 0, lastExit: null, built: false }]));
 let stopping = false;
-
-for (const [n, s] of Object.entries(status)) if (!s.built) log(`⚠ ${n}: build output missing (${apps[n].build}) — did "npm run build" run on the host?`);
 
 function capture(name, stream, out) {
   stream.on('data', (buf) => {
     out.write(buf);
-    const lines = buf.toString('utf8').split(/\r?\n/).filter(Boolean).map((l) => `${new Date().toISOString().slice(11, 19)} ${l}`);
-    logs[name].push(...lines);
-    if (logs[name].length > 80) logs[name].splice(0, logs[name].length - 80);
+    pushLog(name, buf.toString('utf8'));
   });
 }
 
@@ -100,7 +111,75 @@ function start(name, attempt = 0) {
     setTimeout(() => start(name, quick ? attempt + 1 : 0), delay);
   });
 }
-Object.keys(apps).forEach((n) => start(n));
+
+// ── Boot sequence (runs after the port is open, so the host sees the app as "up") ──
+const missingBuilds = () => Object.keys(apps).filter((n) => !existsSync(apps[n].build));
+const hasBuildTools = () => ['node_modules/typescript', 'node_modules/@nestjs/cli', 'node_modules/prisma'].every((p) => existsSync(p));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const LOCK = '.build.lock';
+
+async function ensureBuilt() {
+  if (!missingBuilds().length) return true;
+  log(`build output missing for: ${missingBuilds().join(', ')} — building now (first start can take a few minutes)…`);
+
+  // Another instance already building? Wait for it instead of building twice.
+  if (existsSync(LOCK) && Date.now() - statSync(LOCK).mtimeMs < 20 * 60_000) {
+    phase = 'waiting-for-build';
+    while (existsSync(LOCK) && missingBuilds().length) await sleep(5000);
+    return !missingBuilds().length;
+  }
+  writeFileSync(LOCK, String(process.pid));
+  phase = 'building';
+  try {
+    if (!hasBuildTools()) {
+      log('build tools (devDependencies) not installed — installing them…');
+      // NODE_ENV=production would make npm skip devDependencies, so force them in.
+      if ((await run('build', 'npm install --include=dev --no-audit --no-fund', { ...cleanEnv, NODE_ENV: 'development' })) !== 0) {
+        log('✖ npm install failed — see /healthz?key=… logs.build');
+        return false;
+      }
+    }
+    if ((await run('build', 'npm run build', { ...cleanEnv, NODE_ENV: 'production' })) !== 0) {
+      log('✖ build failed — see /healthz?key=… logs.build');
+      return false;
+    }
+    log('✔ build finished');
+    return true;
+  } finally {
+    try { unlinkSync(LOCK); } catch {}
+  }
+}
+
+async function syncDatabase() {
+  if (process.env.AUTO_MIGRATE === 'false') return;
+  phase = 'database';
+  log('syncing database schema…');
+  const prismaCli = 'node node_modules/prisma/build/index.js';
+  if (!existsSync('node_modules/prisma/build/index.js')) {
+    log('⚠ prisma CLI not installed — skipping database sync.');
+    return;
+  }
+  const code = await run('db', `${prismaCli} db push --schema prisma/schema.prisma --skip-generate`);
+  if (code !== 0) {
+    log('⚠ database sync failed — check DB_HOST / DB_PORT / DB_NAME / DB_USER / DB_PASSWORD (details in /healthz?key=… logs.db). Continuing.');
+    return;
+  }
+  const tsx = existsSync('node_modules/tsx/dist/cli.mjs') ? 'node node_modules/tsx/dist/cli.mjs' : 'npx tsx';
+  if ((await run('db', `${tsx} prisma/seed.ts`)) === 0) log('✔ database ready');
+  else log('⚠ seeding default plans/scopes failed (details in logs.db).');
+}
+
+async function boot() {
+  const built = await ensureBuilt();
+  for (const n of Object.keys(apps)) status[n].built = existsSync(apps[n].build);
+  if (!built) {
+    phase = 'build-failed';
+    return;
+  }
+  await syncDatabase();
+  phase = 'running';
+  Object.keys(apps).forEach((n) => start(n));
+}
 
 const isListening = (port) =>
   new Promise((res) => {
@@ -122,7 +201,7 @@ async function health(req, res) {
   const appsState = {};
   for (const n of Object.keys(apps)) appsState[n] = { ...status[n], listening: await isListening(apps[n].port) };
   const ok = Object.values(appsState).every((a) => a.listening);
-  const body = { status: ok ? 'ok' : 'degraded', node: process.version, apps: appsState };
+  const body = { status: ok ? 'ok' : 'degraded', phase, node: process.version, apps: appsState };
   // Logs only with the secret key: /healthz?key=<INTERNAL_API_KEY>
   if (process.env.INTERNAL_API_KEY && url.searchParams.get('key') === process.env.INTERNAL_API_KEY) {
     body.logs = Object.fromEntries(Object.entries(logs).map(([n, l]) => [n, l.map(redact)]));
@@ -171,8 +250,12 @@ const server = http.createServer((req, res) => {
     },
   );
   upstream.on('error', () => {
-    if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
-    res.end('Service is starting, please retry in a few seconds.');
+    if (!res.headersSent) res.writeHead(phase === 'running' ? 502 : 503, { 'content-type': 'text/plain; charset=utf-8', 'retry-after': '15' });
+    res.end(
+      phase === 'building' || phase === 'waiting-for-build' ? 'Setting up the app (first start builds it, a few minutes). Please refresh shortly.'
+      : phase === 'build-failed' ? 'The app could not be built. Check /healthz for details.'
+      : 'Service is starting, please retry in a few seconds.',
+    );
   });
   req.on('aborted', () => upstream.destroy());
   req.pipe(upstream);
@@ -197,6 +280,10 @@ server.listen(PORT, () => {
   log(`site  ${childEnv.WEB_URL}`);
   log(`api   ${childEnv.API_PUBLIC_URL}/v1`);
   log(`mcp   ${childEnv.MCP_PUBLIC_URL}`);
+  boot().catch((e) => {
+    phase = 'build-failed';
+    log(`✖ boot failed: ${e?.stack || e}`);
+  });
 });
 
 function shutdown() {
